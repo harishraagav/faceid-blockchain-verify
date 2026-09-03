@@ -142,6 +142,142 @@ python src/reverse_search.py path/to/face.jpg
 python src/blockchain.py <some_sha256_hex>
 ```
 
+## Extended capabilities
+
+### Multi-face (group photo) support
+
+The task asks for detecting and matching "a face," but a submitted photo
+may contain several people. `--multi-face` detects **every** face DeepFace
+finds, and independently runs reverse-search + blockchain-anchoring for
+each one:
+
+```bash
+python src/pipeline.py --image path/to/group_photo.jpg --multi-face
+```
+
+Produces `output/record_face1.json`, `output/record_face2.json`, etc. —
+one full record + on-chain transaction per detected face. Faces are
+processed largest-bounding-box-first.
+
+Standalone (detection only, no search/chain — useful for quick checks):
+```bash
+python src/face_id.py path/to/group_photo.jpg --all
+```
+
+### Embedding similarity check (proving the encoding is load-bearing)
+
+Stage 1 produces a 512-dimension face embedding. Beyond feeding the raw
+image to the reverse-search API, `--compare` demonstrates the embedding
+is a genuine identity representation by comparing it (via cosine
+similarity) against a second photo:
+
+```bash
+python src/pipeline.py --image path/to/face.jpg --compare path/to/other_photo_of_same_person.jpg
+```
+
+Prints `SAME PERSON` or `DIFFERENT PEOPLE` with the similarity score,
+and includes the comparison in `pipeline_result.json`. Standalone:
+
+```bash
+python src/similarity.py path/to/photo_a.jpg path/to/photo_b.jpg
+```
+
+Threshold: cosine similarity ≥ 0.70 is classified as the same person —
+the commonly-used default for Facenet512 embeddings. Verified in testing:
+two photos of the same face score ~1.00 (identical crop) down to ~0.75+
+for different photos of the same person; two different people typically
+score well under 0.30.
+
+**Real limitation found in testing**: two genuine photos of the same
+person, one clean-shaven and one with a beard, scored only ~0.52 —
+below the 0.70 threshold, misclassified as "different people." This is
+a known, documented weakness of face-embedding models generally:
+significant appearance changes (facial hair, glasses, major haircuts,
+age gaps) measurably reduce similarity even for the same identity,
+because those features are part of what the embedding actually
+encodes. Lowering the threshold to compensate would reduce the check's
+ability to catch genuine impostors, so this is reported as an honest
+limitation rather than tuned away. In practice this only affects the
+optional `--compare` bonus feature — it has no effect on the core
+face→search→blockchain pipeline, which never compares two embeddings
+against each other.
+
+### Detector backend comparison
+
+`benchmark_detectors.py` runs the same image through three DeepFace
+detector backends (opencv, mtcnn, retinaface) and reports measured
+confidence + wall-clock time for each, rather than asserting which is
+"best" without evidence:
+
+```bash
+python src/benchmark_detectors.py path/to/face.jpg
+```
+
+Measured example (real run, CPU-only, your numbers will vary by
+hardware and image):
+
+| Backend | Result | Confidence | Time |
+|---|---|---|---|
+| opencv | ❌ failed to load | — | 1.9s |
+| mtcnn | ✅ success | 1.00 | 2.6s |
+| retinaface (pipeline default) | ✅ success | 1.00 | 4.2s |
+
+**Finding**: the `opencv` backend failed in testing with `Confirm that
+opencv is installed on your environment!` — not a real missing
+install, but a known packaging inconsistency: DeepFace's `opencv`
+backend needs a Haar Cascade XML file that ships inside the full
+`opencv-python` PyPI package but is sometimes absent from
+`opencv-python-headless` (the smaller-footprint variant used in
+`requirements.txt`, chosen since this project needs no GUI features).
+`mtcnn` and `retinaface` both use their own bundled model weights and
+were unaffected. Fixable by installing `opencv-python` instead, but
+left as-is here since it's not the pipeline's default backend and
+scored no higher than the alternatives when it did work. Documented
+here rather than silently avoided.
+
+Takeaway: retinaface and mtcnn both reliably hit maximum confidence on
+this test image; retinaface is noticeably slower, so mtcnn is a
+reasonable middle ground if throughput matters more than using the
+pipeline's default.
+
+### Smart-contract mode (on-chain event log, queryable by anyone)
+
+`src/blockchain.py`'s default approach (a hash in a raw transaction's
+data field) is fully legitimate but only discoverable if you already
+have the specific tx hash. `contracts/FaceMatchRegistry.sol` is a
+minimal Solidity registry that emits a `RecordRegistered` event on every
+submission, so **all** records ever submitted are discoverable by
+anyone via the contract's event log on PolygonScan — not just one
+you hand someone the tx hash for.
+
+**Deploying it (one-time, ~5 minutes, via Remix — no local Solidity
+toolchain needed):**
+
+1. Go to https://remix.ethereum.org
+2. Create a new file, paste in the contents of `contracts/FaceMatchRegistry.sol`
+3. Left sidebar → **Solidity Compiler** tab → select compiler version
+   `0.8.20` (or compatible) → click **Compile FaceMatchRegistry.sol**
+4. Left sidebar → **Deploy & Run Transactions** tab → set
+   **Environment** to `Injected Provider - MetaMask` → MetaMask will
+   prompt you to connect; make sure MetaMask is switched to the
+   **Polygon Amoy** network first
+5. Click **Deploy**, confirm the transaction in the MetaMask popup
+6. Once mined, copy the deployed **contract address** from Remix's
+   "Deployed Contracts" panel
+7. Paste it into `.env` as `CONTRACT_ADDRESS=0x...`
+
+**Using it:**
+
+```bash
+python src/blockchain_contract.py <hash_hex>          # write (costs gas)
+python src/blockchain_contract.py <hash_hex> --check   # read (free)
+```
+
+Or integrate it into the main pipeline by swapping the import in
+`pipeline.py` from `blockchain.upload_hash_to_chain` to
+`blockchain_contract.register_hash_on_contract` (same call signature
+for the hash argument).
+
 ## Known limitations
 
 - **SerpApi free tier**: 100 searches/month, and its image-upload
@@ -166,43 +302,36 @@ python src/blockchain.py <some_sha256_hex>
 - **Gas/network variability.** Testnet transaction confirmation time
   depends on Amoy network conditions; the pipeline waits up to 180s for
   a receipt before failing.
+- **POA middleware required.** Polygon's block headers use a longer
+  `extraData` field than plain Ethereum (it's a Proof-of-Authority-style
+  chain), which trips web3.py's default response validator. `blockchain.py`
+  injects `ExtraDataToPOAMiddleware` to handle this — if you swap to a
+  different EVM chain, you may or may not still need it.
 
 ## Possible upgrades (not implemented, out of scope for the deadline)
 
-- A minimal Solidity registry contract instead of a raw self-transaction:
-
-  ```solidity
-  // SPDX-License-Identifier: MIT
-  pragma solidity ^0.8.20;
-
-  contract FaceMatchRegistry {
-      event RecordRegistered(bytes32 indexed recordHash, address indexed submitter, uint256 timestamp);
-
-      function registerRecord(bytes32 recordHash) external {
-          emit RecordRegistered(recordHash, msg.sender, block.timestamp);
-      }
-  }
-  ```
-
-  This would let anyone query all records ever submitted by filtering
-  `RecordRegistered` events, rather than needing a specific tx hash.
-- Multi-face batch mode (encode + search + anchor every face in a group
-  photo in one run).
 - A fallback reverse-search provider (e.g. Google Cloud Vision Web
   Detection) if SerpApi's free quota is exhausted mid-demo.
+- Persisting all `output/record_faceN.json` files from a `--multi-face`
+  run into a single combined index, rather than one file per face.
 
 ## Repo layout
 
 ```
 faceid-blockchain-verify/
 ├── src/
-│   ├── face_id.py         # Stage 1: face detect + encode (DeepFace)
-│   ├── reverse_search.py  # Stage 2: live reverse-image search (SerpApi/Google Lens)
-│   ├── blockchain.py      # Stage 3: write + re-fetch on-chain record (Polygon Amoy)
-│   ├── verify.py          # Independent re-verification CLI
-│   ├── utils.py           # Hashing + canonical record building
-│   └── pipeline.py        # Orchestrates all three stages end-to-end
-├── examples/               # Sample/test images
+│   ├── face_id.py             # Stage 1: face detect + encode (DeepFace), single or --all faces
+│   ├── reverse_search.py      # Stage 2: live reverse-image search (SerpApi/Google Lens)
+│   ├── blockchain.py          # Stage 3: raw-tx on-chain record (Polygon Amoy) — default path
+│   ├── blockchain_contract.py # Stage 3 alternative: FaceMatchRegistry smart-contract mode
+│   ├── verify.py               # Independent re-verification CLI
+│   ├── similarity.py           # Embedding comparison (cosine similarity, same/different person)
+│   ├── benchmark_detectors.py  # Measured comparison of detector backends
+│   ├── utils.py                 # Hashing + canonical record building
+│   └── pipeline.py              # Orchestrates all stages; --multi-face, --compare flags
+├── contracts/
+│   └── FaceMatchRegistry.sol   # Optional on-chain registry contract (see "Smart-contract mode")
+├── examples/                    # Sample/test images
 ├── requirements.txt
 ├── .env.example
 └── README.md
