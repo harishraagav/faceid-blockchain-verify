@@ -12,7 +12,7 @@ match to a public blockchain.
      │
      ▼
 ┌─────────────────────┐
-│ 1. Face ID           │  DeepFace (RetinaFace detector + Facenet512
+│ 1. Face ID           │  DeepFace (MTCNN detector + Facenet512
 │    detect + encode   │  embedding model) → 512-d face embedding
 └─────────┬────────────┘
           ▼
